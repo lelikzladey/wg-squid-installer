@@ -25,7 +25,7 @@ if ! grep -qs "ubuntu" /etc/os-release; then
   exit 1
 fi
 os_version=$(grep 'VERSION_ID' /etc/os-release | cut -d '"' -f 2 | tr -d '.')
-if [[ "$os_version" -lt 2204 ]]; then
+if [[ "${os_version:-0}" -lt 2204 ]]; then
   err "Ubuntu 22.04 or newer required."
   exit 1
 fi
@@ -167,10 +167,11 @@ manage_squid_users() {
           echo "Passwords do not match."
         done
         if command -v htpasswd >/dev/null 2>&1; then
+          # use stdin to avoid leaking password in process list
           if htpasswd -h 2>&1 | grep -q '\-B'; then
-            htpasswd -bB "$passfile" "$uname" "$upass"
+            printf '%s\n%s\n' "$upass" "$upass" | htpasswd -i -B "$passfile" "$uname"
           else
-            htpasswd -b "$passfile" "$uname" "$upass"
+            printf '%s\n%s\n' "$upass" "$upass" | htpasswd -i "$passfile" "$uname"
           fi
           chown proxy: "$passfile" 2>/dev/null || chown root: "$passfile" 2>/dev/null || true
           chmod 640 "$passfile" 2>/dev/null || true
@@ -219,30 +220,28 @@ create_proxy_user() {
     return 1
   fi
 
-  # Ensure htpasswd exists
+  # Ensure htpasswd exists; do not auto-install here to avoid repeated apt operations
   if ! command -v htpasswd >/dev/null 2>&1; then
-    if command -v apt-get >/dev/null 2>&1; then
-      apt-get update -y
-      apt-get install -y apache2-utils
-    elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
-      if command -v yum >/dev/null 2>&1; then
-        yum install -y httpd-tools
-      else
-        dnf install -y httpd-tools
-      fi
-    else
-      echo "Please install apache2-utils/httpd-tools manually."
-      return 1
-    fi
+    echo "Error: htpasswd (apache2-utils/httpd-tools) is not installed. Please install it first."
+    return 1
   fi
 
   mkdir -p /etc/squid
 
   local passfile="/etc/squid/passwd"
+  # use stdin to avoid leaking password
   if [ ! -f "$passfile" ]; then
-    htpasswd -cb "$passfile" "$USERNAME" "$PASSWORD"
+    if htpasswd -h 2>&1 | grep -q '\-B'; then
+      printf '%s\n%s\n' "$PASSWORD" "$PASSWORD" | htpasswd -i -B "$passfile" "$USERNAME"
+    else
+      printf '%s\n%s\n' "$PASSWORD" "$PASSWORD" | htpasswd -i "$passfile" "$USERNAME"
+    fi
   else
-    htpasswd -b "$passfile" "$USERNAME" "$PASSWORD"
+    if htpasswd -h 2>&1 | grep -q '\-B'; then
+      printf '%s\n%s\n' "$PASSWORD" "$PASSWORD" | htpasswd -i -B "$passfile" "$USERNAME"
+    else
+      printf '%s\n%s\n' "$PASSWORD" "$PASSWORD" | htpasswd -i "$passfile" "$USERNAME"
+    fi
   fi
 
   # determine squid runtime user
@@ -261,13 +260,19 @@ create_proxy_user() {
   chown "$SQUID_USER":"$SQUID_USER" "$passfile" 2>/dev/null || true
   chmod 640 "$passfile"
 
-  # systemd override to ensure ordering with squid-iptables.service
-  mkdir -p /etc/systemd/system/squid.service.d
-  cat > /etc/systemd/system/squid.service.d/override.conf <<'EOF'
+  # systemd override to ensure ordering with squid-iptables.service (create only if missing)
+  local override_dir="/etc/systemd/system/squid.service.d"
+  local override_file="$override_dir/override.conf"
+  local need_daemon_reload=0
+  if [ ! -f "$override_file" ]; then
+    mkdir -p "$override_dir"
+    cat > "$override_file" <<'EOF'
 [Unit]
 Wants=squid-iptables.service
 After=squid-iptables.service
 EOF
+    need_daemon_reload=1
+  fi
 
   # If caller requested defer, skip service reloads
   if [ "$DEFER" = "defer" ]; then
@@ -275,8 +280,17 @@ EOF
     return 0
   fi
 
-  systemctl daemon-reload || true
-  systemctl restart squid >/dev/null 2>&1 || systemctl reload squid >/dev/null 2>&1 || true
+  # Apply systemd reload only if override was just created
+  if [ "$need_daemon_reload" -eq 1 ]; then
+    systemctl daemon-reload || true
+  fi
+
+  # Restart/reload squid and ensure squid-iptables.service is enabled
+  if systemctl is-active --quiet squid; then
+    systemctl restart squid >/dev/null 2>&1 || systemctl reload squid >/dev/null 2>&1 || true
+  else
+    systemctl start squid >/dev/null 2>&1 || true
+  fi
   systemctl enable --now squid-iptables.service >/dev/null 2>&1 || true
   systemctl restart squid-iptables.service >/dev/null 2>&1 || true
   systemctl restart squid >/dev/null 2>&1 || true
@@ -378,10 +392,11 @@ acl CONNECT method CONNECT
 # Access rules (order matters)
 # Allow WG clients first (optionally without auth)
 http_access allow wg_net
-${http_access_for_auth}
 
-# Deny CONNECT to non-safe ports
+# Deny CONNECT to non-safe ports (apply to everyone before granting auth)
 http_access deny CONNECT !Safe_ports
+
+${http_access_for_auth}
 
 # Default deny
 http_access deny all
@@ -396,6 +411,13 @@ maximum_object_size 16 MB
 
 visible_hostname squid-server
 EOF
+
+  # validate squid config
+  if ! squid -k parse >/dev/null 2>&1; then
+    echo "squid configuration parse failed. Check /var/log/squid/cache.log"
+    tail -n 50 /var/log/squid/cache.log || true
+    pause
+  fi
 
   systemctl enable --now squid || systemctl restart squid || true
 
