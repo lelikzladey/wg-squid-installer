@@ -208,6 +208,83 @@ manage_squid_users() {
   done
 }
 
+# --- вставляемая функция: create_proxy_user() ---
+create_proxy_user() {
+  local USERNAME="$1"
+  local PASSWORD="$2"
+  local DEFER="${3:-}"
+
+  if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
+    echo "Usage: create_proxy_user USERNAME PASSWORD [defer]"
+    return 1
+  fi
+
+  # Ensure htpasswd exists
+  if ! command -v htpasswd >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -y
+      apt-get install -y apache2-utils
+    elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
+      if command -v yum >/dev/null 2>&1; then
+        yum install -y httpd-tools
+      else
+        dnf install -y httpd-tools
+      fi
+    else
+      echo "Please install apache2-utils/httpd-tools manually."
+      return 1
+    fi
+  fi
+
+  mkdir -p /etc/squid
+
+  local passfile="/etc/squid/passwd"
+  if [ ! -f "$passfile" ]; then
+    htpasswd -cb "$passfile" "$USERNAME" "$PASSWORD"
+  else
+    htpasswd -b "$passfile" "$USERNAME" "$PASSWORD"
+  fi
+
+  # determine squid runtime user
+  SQUID_USER=""
+  SQUID_USER=$(ps -eo user,comm | awk '/[s]quid|[p]roxy/ { print $1; exit }' 2>/dev/null || true)
+  if [ -z "$SQUID_USER" ]; then
+    if id -u proxy >/dev/null 2>&1; then
+      SQUID_USER=proxy
+    elif id -u squid >/dev/null 2>&1; then
+      SQUID_USER=squid
+    else
+      SQUID_USER=root
+    fi
+  fi
+
+  chown "$SQUID_USER":"$SQUID_USER" "$passfile" 2>/dev/null || true
+  chmod 640 "$passfile"
+
+  # systemd override to ensure ordering with squid-iptables.service
+  mkdir -p /etc/systemd/system/squid.service.d
+  cat > /etc/systemd/system/squid.service.d/override.conf <<'EOF'
+[Unit]
+Wants=squid-iptables.service
+After=squid-iptables.service
+EOF
+
+  # If caller requested defer, skip service reloads
+  if [ "$DEFER" = "defer" ]; then
+    echo "Proxy user '$USERNAME' added/updated (deferred service reload)."
+    return 0
+  fi
+
+  systemctl daemon-reload || true
+  systemctl restart squid >/dev/null 2>&1 || systemctl reload squid >/dev/null 2>&1 || true
+  systemctl enable --now squid-iptables.service >/dev/null 2>&1 || true
+  systemctl restart squid-iptables.service >/dev/null 2>&1 || true
+  systemctl restart squid >/dev/null 2>&1 || true
+
+  echo "Proxy user '$USERNAME' added/updated and services reloaded/enabled."
+}
+# --- конец вставляемой функции ---
+
 install_squid_interactive() {
   read -p "Install and configure Squid proxy? [Y/n]: " do_squid
   [[ -z "$do_squid" ]] && do_squid="y"
@@ -250,15 +327,14 @@ install_squid_interactive() {
   [[ -z "$create_proxy_user" ]] && create_proxy_user="y"
   if [[ "$create_proxy_user" =~ ^[yY]$ && $auth_enabled -eq 1 ]]; then
     while true; do read -p "Proxy username: " proxy_user; [[ -n "$proxy_user" ]] && break; done
-    while true; do read -s -p "Proxy password: " proxy_pass; echo; read -s -p "Confirm password: " proxy_pass2; echo; [[ "$proxy_pass" == "$proxy_pass2" ]] && break; echo "Mismatch."; done
-    if htpasswd -h 2>&1 | grep -q '\-B'; then
-      htpasswd -bB /etc/squid/passwd "$proxy_user" "$proxy_pass"
-    else
-      htpasswd -cb /etc/squid/passwd "$proxy_user" "$proxy_pass"
-    fi
-    chmod 640 /etc/squid/passwd
-    chown proxy: /etc/squid/passwd 2>/dev/null || chown root: /etc/squid/passwd 2>/dev/null || true
-    echo "Created user $proxy_user"
+    while true; do
+      read -s -p "Proxy password: " proxy_pass; echo
+      read -s -p "Confirm password: " proxy_pass2; echo
+      [[ "$proxy_pass" == "$proxy_pass2" ]] && break
+      echo "Mismatch."
+    done
+    # Use create_proxy_user so ownership/htpasswd/systemd reload is handled consistently
+    create_proxy_user "$proxy_user" "$proxy_pass"
   elif [[ "$create_proxy_user" =~ ^[yY]$ && $auth_enabled -eq 0 ]]; then
     echo "Skipping user creation because auth helper is not available."
   fi
